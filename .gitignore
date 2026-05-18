@@ -1,0 +1,22 @@
+# Згенерований контент
+data/
+logs/
+
+# Локальні налаштування (пароль адміна тощо)
+admin.local.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,16 @@
+[Unit]
+Description=Kiosk — Побач себе в майбутньому
+After=graphical.target
+
+[Service]
+User=kiosk
+Environment=DISPLAY=:0
+WorkingDirectory=/opt/kiosk
+ExecStart=/opt/kiosk/.venv/bin/python /opt/kiosk/main.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/kiosk/stdout.log
+StandardError=append:/var/log/kiosk/stderr.log
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile config.py logging_setup.py camera.py segmentation.py pose.py roles.py overlay.py photo.py photo_server.py qr.py ui.py admin.py main.py generate_placeholders.py)",
+      "Bash(echo \"exit=$?\")",
+      "PowerShell(py *)"
+    ]
+  }
+}
