@@ -43,19 +43,24 @@ class AppState(Enum):
 
 
 class App:
-    def __init__(self, mock: bool = False, windowed: bool = False):
+    def __init__(self, mock: bool = False, windowed: bool = False, scale: float = 1.0):
         self.mock = mock
         self.windowed = windowed
+        self.scale = max(0.1, min(scale, 1.0))
         self.running = True
 
         pygame.init()
+        # render_target — завжди 1080×1920 (всі координати в цьому просторі).
+        # screen — реальне вікно (можливо менше через --scale у dev-режимі).
+        self.render_target = pygame.Surface((config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT))
+        window_size = (int(config.DISPLAY_WIDTH * self.scale), int(config.DISPLAY_HEIGHT * self.scale))
         flags = 0 if windowed else (pygame.FULLSCREEN | pygame.NOFRAME)
-        self.screen = pygame.display.set_mode((config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT), flags)
+        self.screen = pygame.display.set_mode(window_size, flags)
         pygame.display.set_caption("Побач себе в майбутньому")
-        pygame.mouse.set_visible(False)
+        pygame.mouse.set_visible(self.scale < 1.0 or windowed)
         self.clock = pygame.time.Clock()
 
-        # IDLE background (опціонально)
+        # IDLE background (опціонально) — на render_target розмір
         self.idle_bg: pygame.Surface | None = None
         if config.IDLE_BG_PATH.exists():
             self.idle_bg = pygame.transform.smoothscale(
@@ -110,6 +115,12 @@ class App:
 
     # --- Обробка подій ---
 
+    def _unscale_pos(self, pos: tuple[int, int]) -> tuple[int, int]:
+        """Конвертує координати з простору вікна в простір render_target (1080×1920)."""
+        if self.scale == 1.0:
+            return pos
+        return (int(pos[0] / self.scale), int(pos[1] / self.scale))
+
     def _handle_events(self) -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -120,6 +131,10 @@ class App:
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE and self.windowed:
                 self.running = False
                 return
+
+            # Inverse-scale тач-координат для всіх mouse-подій
+            if event.type == pygame.MOUSEBUTTONDOWN and self.scale != 1.0:
+                event = pygame.event.Event(event.type, {**event.dict, "pos": self._unscale_pos(event.pos)})
 
             # Подвійне F12 — вхід в адмін з будь-якого стану
             if self.state != AppState.ADMIN and self.admin_key.handle(event):
@@ -214,26 +229,34 @@ class App:
     # --- Render ---
 
     def _render(self) -> None:
+        target = self.render_target
+
         if self.state == AppState.IDLE:
-            ui.render_idle(self.screen, self.idle_bg)
+            ui.render_idle(target, self.idle_bg)
 
         elif self.state == AppState.MENU:
-            self.menu_zones = ui.render_menu(self.screen, self.role_manager.list())
+            self.menu_zones = ui.render_menu(target, self.role_manager.list())
 
         elif self.state == AppState.COUNTDOWN:
             self._last_composite = self._render_composite()
             elapsed = time.monotonic() - (self.countdown_started_at or time.monotonic())
             remaining = max(0, int(config.COUNTDOWN_SECONDS - elapsed) + 1)
             remaining = min(remaining, config.COUNTDOWN_SECONDS)
-            ui.render_countdown(self.screen, self._last_composite, remaining)
+            ui.render_countdown(target, self._last_composite, remaining)
 
         elif self.state == AppState.PHOTO_QR:
             seconds_left = max(0, int(config.PHOTO_QR_DISPLAY - self._time_in_state()))
-            ui.render_photo_qr(self.screen, self.last_photo_bgr, self.last_qr_bgr, seconds_left)
+            ui.render_photo_qr(target, self.last_photo_bgr, self.last_qr_bgr, seconds_left)
 
         elif self.state == AppState.ADMIN:
-            self.admin.render(self.screen)
+            self.admin.render(target)
 
+        # Blit render_target → screen зі scaling (якщо scale != 1.0)
+        if self.scale == 1.0:
+            self.screen.blit(target, (0, 0))
+        else:
+            scaled = pygame.transform.smoothscale(target, self.screen.get_size())
+            self.screen.blit(scaled, (0, 0))
         pygame.display.flip()
 
     # --- Main loop ---
@@ -265,6 +288,10 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Kiosk «Побач себе в майбутньому»")
     p.add_argument("--mock", action="store_true", help="Mock-камера з assets/dev/mock_frame.jpg")
     p.add_argument("--windowed", action="store_true", help="Вікно замість fullscreen (для розробки)")
+    p.add_argument(
+        "--scale", type=float, default=1.0,
+        help="Масштаб вікна для dev (наприклад 0.5 → 540×960). Тач-координати інверс-масштабуються.",
+    )
     return p.parse_args()
 
 
@@ -272,7 +299,7 @@ def main() -> int:
     args = parse_args()
     setup_logging()
     logger.info("Starting kiosk; argv=%s", sys.argv)
-    app = App(mock=args.mock, windowed=args.windowed)
+    app = App(mock=args.mock, windowed=args.windowed, scale=args.scale)
     app.run()
     return 0
 
