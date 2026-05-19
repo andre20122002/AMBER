@@ -95,11 +95,12 @@ def _fit_costume_to_pose(
         dy = pose.right_shoulder[1] - pose.left_shoulder[1]
         angle_rad = math.atan2(dy, dx)
         angle_deg = math.degrees(angle_rad)
-        # Clamp ±25°: захист від pose-glitch (різкі стрибки кутів)
-        angle_deg = float(np.clip(angle_deg, -25.0, 25.0))
+        # Clamp ±15°: реальні нахили рідко > 15°, ширший range маскує pose-помилки
+        angle_deg = float(np.clip(angle_deg, -15.0, 15.0))
 
     scale = target_w / anchor_w
-    scale = float(np.clip(scale, 0.5, 2.0))
+    # Розширений clamp: маленький scale для дальньої людини, великий для close-up через face fallback
+    scale = float(np.clip(scale, 0.3, 3.5))
 
     # Anchor у пікселях канвасу костюма (симетричний по X)
     src_x = 0.5 * W
@@ -225,18 +226,29 @@ def _draw_debug_overlay(
     warp_info: dict,
     fps: float | None,
 ) -> np.ndarray:
-    """Малює landmarks, anchor point, текстову інформацію поверх композиту."""
+    """Малює landmarks (всі ≈543 точок Holistic), anchor, текстову інформацію."""
     H, W = img_bgr.shape[:2]
     out = img_bgr.copy()
 
     source_color = {
-        "full": (0, 255, 0),    # зелений
-        "face": (0, 200, 255),  # помаранчевий
-        "hold": (180, 180, 180),  # сірий
+        "full": (0, 255, 0),
+        "face": (0, 200, 255),
+        "hold": (180, 180, 180),
     }
 
+    total_landmarks = 0
     if pose is not None:
         color = source_color.get(pose.source, (0, 255, 0))
+
+        # Усі landmarks (≈543 від Holistic) — маленькі жовті точки по всьому тілу
+        if pose.all_landmarks:
+            total_landmarks = len(pose.all_landmarks)
+            for (lx, ly) in pose.all_landmarks:
+                px, py = int(lx * W), int(ly * H)
+                if 0 <= px < W and 0 <= py < H:
+                    cv2.circle(out, (px, py), 2, (0, 255, 255), -1)
+
+        # Ключові 4 — більші круги поверх
         for label, pt in [
             ("L_sh", pose.left_shoulder),
             ("R_sh", pose.right_shoulder),
@@ -248,7 +260,7 @@ def _draw_debug_overlay(
             cv2.circle(out, (x, y), 14, (0, 0, 0), 2)
             cv2.putText(out, label, (x + 18, y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        # Лінія між плечима (видно ротацію)
+        # Лінія між плечима — показує кут ротації
         lx, ly = int(pose.left_shoulder[0] * W), int(pose.left_shoulder[1] * H)
         rx, ry = int(pose.right_shoulder[0] * W), int(pose.right_shoulder[1] * H)
         cv2.line(out, (lx, ly), (rx, ry), color, 3)
@@ -260,7 +272,7 @@ def _draw_debug_overlay(
     # Текстова інформація — верхній лівий кут
     lines = []
     if pose is not None:
-        lines.append(f"source={pose.source}  conf={pose.confidence:.2f}")
+        lines.append(f"source={pose.source}  conf={pose.confidence:.2f}  N={total_landmarks}")
     else:
         lines.append("pose=None")
     lines.append(f"scale={warp_info['scale']:.2f}  angle={warp_info['angle_deg']:+.1f}°")
@@ -291,10 +303,8 @@ def _remap_pose_to_display(
     src_aspect = src_w / src_h
 
     def remap(x: float, y: float) -> tuple[float, float]:
-        # Перевести нормалізовані координати в піксельні (відносно вхідного кадру)
         px = x * src_w
         py = y * src_h
-        # Обчислити, який саме crop ми робили
         if src_aspect > target_aspect:
             new_w = int(src_h * target_aspect)
             x0 = (src_w - new_w) // 2
@@ -307,7 +317,6 @@ def _remap_pose_to_display(
             py -= y0
             new_h_after_crop = new_h
             new_w_after_crop = src_w
-        # Тепер нормалізувати назад у [0..1] відносно cropped + ресайзнутого = dst
         return (px / new_w_after_crop, py / new_h_after_crop)
 
     return PoseResult(
@@ -316,4 +325,6 @@ def _remap_pose_to_display(
         head=remap(*pose.head),
         hips_center=remap(*pose.hips_center),
         confidence=pose.confidence,
+        source=pose.source,
+        all_landmarks=[remap(x, y) for (x, y) in pose.all_landmarks],
     )

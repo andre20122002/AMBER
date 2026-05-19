@@ -86,10 +86,11 @@ def make_background(role_data: dict, out_path: Path) -> None:
 
 
 def make_costume(role_data: dict, out_path: Path) -> None:
-    """PNG RGBA: верхня частина — «капелюх/декорація», середина прозора (там буде людина),
-    низ — силует плечей з кольором ролі.
+    """PNG RGBA: тільки тіло + плечі + комір — БЕЗ великого капелюха над головою.
 
     Дизайн узгоджений з COSTUME_DESIGN_SHOULDERS_CY=0.28, _W=0.45.
+    Голова відвідувача показується через прозору частину — її розмір/положення
+    залежить від реального тіла і pose, а не від фіксованого декоративного елемента.
     """
     img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -97,23 +98,14 @@ def make_costume(role_data: dict, out_path: Path) -> None:
     accent = role_data["accent_color"]
     costume_col = role_data["costume_color"]
 
-    # «Капелюх/корона» — еліпс зверху
-    hat_cy = int(H * 0.08)
-    hat_w = int(W * 0.35)
-    hat_h = int(H * 0.05)
-    draw.ellipse(
-        [W // 2 - hat_w // 2, hat_cy - hat_h, W // 2 + hat_w // 2, hat_cy + hat_h],
-        fill=accent,
-    )
-
     # «Плечі» — трапеція з центром на (0.5, 0.28) і шириною 0.45*W
     sh_cy = int(H * DESIGN_SHOULDERS_CY)
     sh_w = int(W * DESIGN_SHOULDERS_W)
     sh_left = W // 2 - sh_w // 2
     sh_right = W // 2 + sh_w // 2
     # Трапеція вниз (плечі → пояс)
-    waist_w = int(sh_w * 0.7)
-    waist_cy = int(H * 0.85)
+    waist_w = int(sh_w * 0.75)
+    waist_cy = int(H * 0.95)
     waist_left = W // 2 - waist_w // 2
     waist_right = W // 2 + waist_w // 2
     draw.polygon(
@@ -121,24 +113,34 @@ def make_costume(role_data: dict, out_path: Path) -> None:
         fill=costume_col,
     )
 
-    # Комір
+    # Комір — V-образний виріз на торсі (під obличчя людини)
     collar_y = sh_cy
-    collar_w = int(W * 0.12)
+    collar_w = int(W * 0.10)
     draw.polygon(
         [
             (W // 2 - collar_w, collar_y),
             (W // 2 + collar_w, collar_y),
-            (W // 2, collar_y + int(H * 0.08)),
+            (W // 2, collar_y + int(H * 0.10)),
         ],
         fill=accent,
     )
 
-    # Декоративна стрічка (як орденська)
-    ribbon_y1 = sh_cy + int(H * 0.05)
-    ribbon_y2 = sh_cy + int(H * 0.20)
+    # Орденська стрічка по центру торса
+    ribbon_y1 = sh_cy + int(H * 0.12)
+    ribbon_y2 = sh_cy + int(H * 0.28)
     ribbon_x1 = W // 2 - int(W * 0.04)
     ribbon_x2 = W // 2 + int(W * 0.04)
     draw.rectangle([ribbon_x1, ribbon_y1, ribbon_x2, ribbon_y2], fill=accent)
+
+    # Медальйон в центрі торса (як на грудях)
+    med_cy = sh_cy + int(H * 0.20)
+    med_r = int(W * 0.05)
+    draw.ellipse(
+        [W // 2 - med_r, med_cy - med_r, W // 2 + med_r, med_cy + med_r],
+        fill=accent,
+        outline=(255, 255, 255, 200),
+        width=3,
+    )
 
     # Лейбл «PLACEHOLDER» дрібним текстом у куті
     font = _get_font(28)

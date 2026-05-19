@@ -1,15 +1,18 @@
-"""Pose detection через MediaPipe Pose + Face fallback.
+"""Pose + Face + Hands детекція через MediaPipe Holistic.
 
-Стратегія:
-1. Спочатку повний pose (потрібно бачити плечі/торс)
-2. Якщо не вдалось — face detection і обчислення "уявних" плечей від bbox обличчя
-3. Якщо і це не вдалось — None (вище по стеку PoseTracker зробить hold-last-good)
+Holistic дає одним проходом:
+  - 33 pose landmarks (тіло)
+  - 468 face landmarks (FaceMesh)
+  - 21 + 21 = 42 hand landmarks
+  ─────────────────────────────
+  Разом ≈ 543 точки по всьому тілу.
 
-Повертає уніфікований PoseResult з полем .source, щоб overlay/debug могли
-розрізняти джерело.
+PoseResult зберігає:
+  - 4 ключові точки (left_sh, right_sh, head, hips_center) для overlay/smoothing
+  - all_landmarks (повний список) для debug-візуалізації
 """
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import cv2
@@ -20,25 +23,37 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Індекси landmarks у MediaPipe Pose
+# Pose індекси
 _NOSE = 0
 _LEFT_SHOULDER = 11
 _RIGHT_SHOULDER = 12
 _LEFT_HIP = 23
 _RIGHT_HIP = 24
 
+# FaceMesh індекси для контурного bbox
+_FACE_TOP = 10
+_FACE_BOTTOM = 152
+_FACE_LEFT = 234
+_FACE_RIGHT = 454
+_FACE_NOSE = 1
+
 PoseSource = Literal["full", "face", "hold"]
 
 
 @dataclass
 class PoseResult:
-    """Нормалізовані координати [0..1] відносно вхідного кадру."""
+    """Уніфікований результат для overlay/smoothing.
+
+    Нормалізовані координати [0..1] відносно вхідного кадру.
+    """
     left_shoulder: tuple[float, float]
     right_shoulder: tuple[float, float]
     head: tuple[float, float]
     hips_center: tuple[float, float]
     confidence: float
     source: PoseSource = "full"
+    # Всі landmarks для debug-візуалізації: list[(x, y)] у нормалізованих координатах
+    all_landmarks: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def shoulders_center(self) -> tuple[float, float]:
@@ -54,33 +69,56 @@ class PoseResult:
         return float(np.hypot(dx, dy))
 
 
+def _collect_all_landmarks(results) -> list[tuple[float, float]]:
+    """Збирає всі landmarks (pose + face + hands) в один list для debug."""
+    out: list[tuple[float, float]] = []
+    if results.pose_landmarks:
+        out.extend((lm.x, lm.y) for lm in results.pose_landmarks.landmark)
+    if results.face_landmarks:
+        out.extend((lm.x, lm.y) for lm in results.face_landmarks.landmark)
+    if results.left_hand_landmarks:
+        out.extend((lm.x, lm.y) for lm in results.left_hand_landmarks.landmark)
+    if results.right_hand_landmarks:
+        out.extend((lm.x, lm.y) for lm in results.right_hand_landmarks.landmark)
+    return out
+
+
 class PoseDetector:
     def __init__(self):
-        mp_pose = mp.solutions.pose
-        self.pose_model = mp_pose.Pose(
+        mp_holistic = mp.solutions.holistic
+        self.model = mp_holistic.Holistic(
+            static_image_mode=False,
             model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=config.POSE_MIN_CONFIDENCE,
-            min_tracking_confidence=config.POSE_MIN_CONFIDENCE,
-        )
-        mp_face = mp.solutions.face_detection
-        # model_selection=1 — full-range (краще для близьких облич у kiosk)
-        self.face_model = mp_face.FaceDetection(
-            model_selection=1,
+            smooth_landmarks=True,
+            refine_face_landmarks=False,  # False: 468 точок; True: 478 (з iris) — повільніше
             min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
         )
-        logger.info("Pose + FaceDetection models loaded")
+        logger.info("Holistic model loaded (pose+face+hands)")
 
     def detect(self, frame_bgr: np.ndarray) -> PoseResult | None:
-        """Спочатку повний pose; якщо None — face fallback."""
-        full = self._detect_full_pose(frame_bgr)
-        if full is not None:
-            return full
-        return self._detect_face_pose(frame_bgr)
-
-    def _detect_full_pose(self, frame_bgr: np.ndarray) -> PoseResult | None:
+        """Розумне об'єднання pose + face з пріоритетом за умовами."""
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        results = self.pose_model.process(rgb)
+        results = self.model.process(rgb)
+        all_lms = _collect_all_landmarks(results)
+
+        # Face-pose з FaceMesh (якщо є)
+        face_pose = self._face_pose_from_mesh(results, all_lms)
+
+        # Якщо face займає >20% ширини кадру — це close-up, trust face
+        # (pose дає галюцинації плечей коли торса не видно)
+        if face_pose is not None and self._face_bbox_width(face_pose) > 0.20:
+            return face_pose
+
+        # Спроба повного pose
+        full_pose = self._full_pose_from_results(results, all_lms)
+        if full_pose is not None:
+            return full_pose
+
+        # Fallback на face (якщо є)
+        return face_pose
+
+    def _full_pose_from_results(self, results, all_lms: list) -> PoseResult | None:
         if not results.pose_landmarks:
             return None
 
@@ -93,6 +131,13 @@ class PoseDetector:
         left_sh = (lm[_LEFT_SHOULDER].x, lm[_LEFT_SHOULDER].y)
         right_sh = (lm[_RIGHT_SHOULDER].x, lm[_RIGHT_SHOULDER].y)
         head = (lm[_NOSE].x, lm[_NOSE].y)
+
+        # Sanity-check: на close-up pose галюцинує плечі через увесь кадр
+        sh_width = float(np.hypot(left_sh[0] - right_sh[0], left_sh[1] - right_sh[1]))
+        if sh_width > 0.75:
+            return None
+        if head[1] < 0.05:
+            return None
 
         left_hip = lm[_LEFT_HIP]
         right_hip = lm[_RIGHT_HIP]
@@ -111,53 +156,61 @@ class PoseDetector:
             hips_center=hips_center,
             confidence=float(np.mean(visibilities)),
             source="full",
+            all_landmarks=all_lms,
         )
 
-    def _detect_face_pose(self, frame_bgr: np.ndarray) -> PoseResult | None:
-        """Будує уявні плечі/тіло від bbox обличчя (для close-up, коли торс не видно)."""
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        results = self.face_model.process(rgb)
-        if not results.detections:
+    def _face_pose_from_mesh(self, results, all_lms: list) -> PoseResult | None:
+        """Будує уявні плечі/тіло з FaceMesh-контуру обличчя."""
+        if not results.face_landmarks:
             return None
 
-        # Беремо найбільше обличчя (близьке до камери)
-        best = max(results.detections, key=lambda d: d.location_data.relative_bounding_box.width)
-        bbox = best.location_data.relative_bounding_box
-        x, y, w, h = bbox.xmin, bbox.ymin, bbox.width, bbox.height
+        face = results.face_landmarks.landmark
+        top = face[_FACE_TOP]
+        bottom = face[_FACE_BOTTOM]
+        left = face[_FACE_LEFT]
+        right = face[_FACE_RIGHT]
+        nose = face[_FACE_NOSE]
 
-        # Голова (за приблизним центром bbox, трохи вище — там очі/ніс)
-        head_x = x + w / 2
-        head_y = y + h * 0.4
+        # bbox обличчя
+        x = min(left.x, right.x)
+        y = top.y
+        w = abs(right.x - left.x)
+        h = abs(bottom.y - top.y)
 
-        # Уявні плечі: на 1.8 висоти обличчя нижче верху bbox, шириною 2.5 ширини обличчя
+        # Уявні плечі: на 1.8 висоти обличчя нижче, шириною 2.5x ширини обличчя.
+        # АЛЕ clamp до 0.85 по Y — щоб костюм-комір не «приклеювався» до низу кадру
+        # коли обличчя близько (тоді shoulders розрахункові поза кадром).
         sh_cx = x + w / 2
-        sh_cy = y + h * 1.8
+        sh_cy = min(y + h * 1.8, 0.85)
         sh_half_w = w * 1.25
-
-        # Convention як у MediaPipe Pose: left = менший X на екрані (стандарт image space)
+        # left = менший X (convention як у MediaPipe Pose)
         left_sh = (sh_cx - sh_half_w, sh_cy)
         right_sh = (sh_cx + sh_half_w, sh_cy)
 
-        # Стегна — ще нижче (для симетрії з full-pose, хоча в face режимі вони поза кадром)
-        hips_y = sh_cy + h * 1.5
-        hips_center = (sh_cx, min(1.0, hips_y))
+        hips_y = min(sh_cy + h * 1.5, 0.98)
+        hips_center = (sh_cx, hips_y)
 
-        # Clamp координат у [0..1]
         def clamp(p: tuple[float, float]) -> tuple[float, float]:
             return (float(np.clip(p[0], 0.0, 1.0)), float(np.clip(p[1], 0.0, 1.0)))
 
         return PoseResult(
             left_shoulder=clamp(left_sh),
             right_shoulder=clamp(right_sh),
-            head=clamp((head_x, head_y)),
+            head=clamp((nose.x, nose.y)),
             hips_center=clamp(hips_center),
-            confidence=float(best.score[0]) if best.score else 0.5,
+            confidence=0.9,  # FaceMesh не дає score, але якщо знайдено — впевнено
             source="face",
+            all_landmarks=all_lms,
         )
 
+    @staticmethod
+    def _face_bbox_width(face_pose: PoseResult) -> float:
+        """face_bbox_width ≈ shoulders_width / 2.5 (бо плечі генерувались як face_w * 2.5)."""
+        sh_width = abs(face_pose.right_shoulder[0] - face_pose.left_shoulder[0])
+        return sh_width / 2.5
+
     def close(self) -> None:
-        self.pose_model.close()
-        self.face_model.close()
+        self.model.close()
 
 
 if __name__ == "__main__":
@@ -181,6 +234,11 @@ if __name__ == "__main__":
             preview = frame.copy()
             if pose:
                 h, w = frame.shape[:2]
+                # Малюємо всі landmarks
+                for (lx, ly) in pose.all_landmarks:
+                    px, py = int(lx * w), int(ly * h)
+                    cv2.circle(preview, (px, py), 1, (0, 255, 255), -1)
+                # Ключові підкреслено
                 color = (0, 255, 0) if pose.source == "full" else (0, 200, 255)
                 for label, pt in [
                     ("L_sh", pose.left_shoulder),
@@ -190,10 +248,9 @@ if __name__ == "__main__":
                 ]:
                     x, y = int(pt[0] * w), int(pt[1] * h)
                     cv2.circle(preview, (x, y), 8, color, -1)
-                    cv2.putText(preview, label, (x + 10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
                 cv2.putText(
                     preview,
-                    f"source={pose.source} conf={pose.confidence:.2f}",
+                    f"source={pose.source} N={len(pose.all_landmarks)}",
                     (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2,
                 )
