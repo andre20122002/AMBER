@@ -12,7 +12,9 @@ import argparse
 import collections
 import logging
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum, auto
 from pathlib import Path
 
@@ -21,12 +23,13 @@ import pygame
 
 import config
 from admin import AdminKeyDetector, AdminPanel
+from aging_ml import MLAger
 from camera import CameraThread
 from logging_setup import setup_logging
 from overlay import compose
 from photo import save_photo
 from photo_server import PhotoHTTPServer
-from pose import PoseDetector
+from pose import PoseDetector, PoseResult
 from pose_smoother import PoseTracker
 from qr import make_qr
 from roles import Role, RoleManager
@@ -98,6 +101,10 @@ class App:
         self.pose_detector = PoseDetector()
         self.pose_tracker = PoseTracker(self.pose_detector)
         self.role_manager = RoleManager()
+        self.ml_ager = MLAger()
+        self.aging_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="aging")
+        self._aging_lock = threading.Lock()
+        self.aging_in_progress = False
         self.photo_server = PhotoHTTPServer()
         self.photo_server_ok = self.photo_server.start()
         self.admin = AdminPanel(
@@ -235,23 +242,54 @@ class App:
         if composite is None:
             logger.warning("No composite available for capture")
             return
+        # Показуємо «початкове» фото одразу, поки aging обробляється у фоні
+        self.last_photo_bgr = composite
+        self.last_qr_bgr = None
+        # Зберігаємо snapshot pose і role, щоб background-thread мав консистентні дані
+        snapshot_pose = self.pose_tracker._last_good
+        snapshot_role = self.current_role
+        if config.AGING_ENABLED and snapshot_role is not None:
+            with self._aging_lock:
+                self.aging_in_progress = True
+            self.aging_executor.submit(
+                self._do_aging_and_save, composite, snapshot_pose, snapshot_role
+            )
+        else:
+            # Без aging — зберегти одразу
+            self._save_and_qr(composite)
+
+    def _do_aging_and_save(self, composite, pose, role) -> None:
+        """Виконується у background thread."""
         try:
-            path = save_photo(composite)
-            self.last_photo_bgr = composite
-            if self.photo_server_ok:
-                url = self.photo_server.get_url(path)
-                logger.info("Photo URL: %s", url)
-                self.last_qr_bgr = make_qr(url)
-            else:
-                self.last_qr_bgr = None
+            aged = self.ml_ager.process(composite, pose, role.age_offset)
+            self._save_and_qr(aged)
+            self.last_photo_bgr = aged
         except Exception:
-            logger.exception("Photo capture failed")
+            logger.exception("Aging failed; saving original")
+            try:
+                self._save_and_qr(composite)
+            except Exception:
+                logger.exception("Save also failed")
+        finally:
+            with self._aging_lock:
+                self.aging_in_progress = False
+
+    def _save_and_qr(self, img_bgr) -> None:
+        path = save_photo(img_bgr)
+        if self.photo_server_ok:
+            url = self.photo_server.get_url(path)
+            logger.info("Photo URL: %s", url)
+            self.last_qr_bgr = make_qr(url)
+        else:
+            self.last_qr_bgr = None
 
     def _reset_to_idle(self) -> None:
         self.current_role = None
         self.last_photo_bgr = None
         self.last_qr_bgr = None
         self._last_composite = None
+        with self._aging_lock:
+            self.aging_in_progress = False
         # Скидаємо smoothing — наступний відвідувач починає з чистого аркуша
         self.pose_tracker.reset()
         self._transition(AppState.IDLE)
@@ -276,7 +314,10 @@ class App:
 
         elif self.state == AppState.PHOTO_QR:
             seconds_left = max(0, int(config.PHOTO_QR_DISPLAY - self._time_in_state()))
-            ui.render_photo_qr(target, self.last_photo_bgr, self.last_qr_bgr, seconds_left)
+            ui.render_photo_qr(
+                target, self.last_photo_bgr, self.last_qr_bgr, seconds_left,
+                aging_in_progress=self.aging_in_progress,
+            )
 
         elif self.state == AppState.ADMIN:
             self.admin.render(target)
@@ -313,6 +354,7 @@ class App:
             self.segmenter.close()
             self.pose_detector.close()
             self.photo_server.stop()
+            self.aging_executor.shutdown(wait=False, cancel_futures=True)
             pygame.quit()
         except Exception:
             logger.exception("Error during shutdown")

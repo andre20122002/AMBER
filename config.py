@@ -38,6 +38,12 @@ POSE_HOLD_FRAMES = 30           # ≈1с при 30FPS — скільки три�
 # відбувається ПІСЛЯ flip, тож координати вже в дзеркальному просторі.
 MIRROR_CAMERA = True
 
+# --- Aging (старіння обличчя — концепція «у майбутньому») ---
+AGING_ENABLED = True
+AGING_REALTIME_INTENSITY = 0.9   # глобальний множник інтенсивності real-time aging
+AGING_MODEL_PATH = Path("models/aging.onnx")  # ML модель для photo-режиму (опційно)
+AGING_ML_ENABLED = False  # вмикається коли модель завантажена
+
 # --- Адмін (без імпорту pygame) ---
 ADMIN_KEY_NAME = "F12"        # подвійне натискання
 ADMIN_KEY_TIMEOUT = 1.0       # секунди між першим і другим F12

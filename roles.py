@@ -30,6 +30,8 @@ class Role:
     # Опційні per-role anchor overrides (де у дизайні костюма «плечі»)
     anchor_cy: float = 0.28
     anchor_w: float = 0.45
+    # На скільки років постаріти обличчя для цієї ролі (вплив aging-pipeline)
+    age_offset: int = 30
 
 
 class RoleManager:
@@ -96,6 +98,7 @@ class RoleManager:
             background_bgr=background_bgr,
             anchor_cy=float(anchor.get("shoulders_cy", 0.28)),
             anchor_w=float(anchor.get("shoulders_w", 0.45)),
+            age_offset=int(meta.get("age_offset", 30)),
         )
 
     def list(self) -> list[Role]:

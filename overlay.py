@@ -14,8 +14,19 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 import config
+from aging_realtime import RealtimeAger
 from pose import PoseResult
 from roles import Role
+
+# Lazy-init єдиного ager на модуль
+_ager: RealtimeAger | None = None
+
+
+def _get_ager() -> RealtimeAger:
+    global _ager
+    if _ager is None:
+        _ager = RealtimeAger(intensity_multiplier=config.AGING_REALTIME_INTENSITY)
+    return _ager
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +206,12 @@ def compose(
     frame_disp = center_crop_to_aspect(frame_bgr, W, H)
     mask_disp = center_crop_to_aspect(mask_float, W, H)
 
+    # 1.5. Real-time aging — на людині, ДО блендингу з фоном.
+    # Face landmarks в просторі вхідного кадру, треба remap у display space.
+    if config.AGING_ENABLED and pose is not None and pose.face_landmarks:
+        face_lms_display = _remap_landmarks(pose.face_landmarks, frame_bgr.shape[:2], (H, W))
+        frame_disp = _get_ager().apply(frame_disp, face_lms_display, role.age_offset)
+
     # 2. Alpha-blend фігури на фоні ролі
     alpha = mask_disp[..., None]
     composite = (
@@ -288,15 +305,8 @@ def _draw_debug_overlay(
     return out
 
 
-def _remap_pose_to_display(
-    pose: PoseResult | None,
-    src_hw: tuple[int, int],
-    dst_hw: tuple[int, int],
-) -> PoseResult | None:
-    """Перенормалізує координати pose з простору камери в простір дисплея після center-crop."""
-    if pose is None:
-        return None
-
+def _make_remap(src_hw: tuple[int, int], dst_hw: tuple[int, int]):
+    """Повертає функцію remap(x, y) для center-crop переходу простір_src → простір_dst."""
     src_h, src_w = src_hw
     dst_h, dst_w = dst_hw
     target_aspect = dst_w / dst_h
@@ -319,6 +329,27 @@ def _remap_pose_to_display(
             new_w_after_crop = src_w
         return (px / new_w_after_crop, py / new_h_after_crop)
 
+    return remap
+
+
+def _remap_landmarks(
+    landmarks: list[tuple[float, float]],
+    src_hw: tuple[int, int],
+    dst_hw: tuple[int, int],
+) -> list[tuple[float, float]]:
+    remap = _make_remap(src_hw, dst_hw)
+    return [remap(x, y) for (x, y) in landmarks]
+
+
+def _remap_pose_to_display(
+    pose: PoseResult | None,
+    src_hw: tuple[int, int],
+    dst_hw: tuple[int, int],
+) -> PoseResult | None:
+    """Перенормалізує координати pose з простору камери в простір дисплея після center-crop."""
+    if pose is None:
+        return None
+    remap = _make_remap(src_hw, dst_hw)
     return PoseResult(
         left_shoulder=remap(*pose.left_shoulder),
         right_shoulder=remap(*pose.right_shoulder),
@@ -327,4 +358,5 @@ def _remap_pose_to_display(
         confidence=pose.confidence,
         source=pose.source,
         all_landmarks=[remap(x, y) for (x, y) in pose.all_landmarks],
+        face_landmarks=[remap(x, y) for (x, y) in pose.face_landmarks],
     )

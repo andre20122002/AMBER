@@ -54,6 +54,8 @@ class PoseResult:
     source: PoseSource = "full"
     # Всі landmarks для debug-візуалізації: list[(x, y)] у нормалізованих координатах
     all_landmarks: list[tuple[float, float]] = field(default_factory=list)
+    # FaceMesh landmarks окремо (468 точок) — для aging-pipeline
+    face_landmarks: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def shoulders_center(self) -> tuple[float, float]:
@@ -83,6 +85,13 @@ def _collect_all_landmarks(results) -> list[tuple[float, float]]:
     return out
 
 
+def _collect_face_landmarks(results) -> list[tuple[float, float]]:
+    """Окремо повертає лише face landmarks (468 точок FaceMesh) для aging."""
+    if not results.face_landmarks:
+        return []
+    return [(lm.x, lm.y) for lm in results.face_landmarks.landmark]
+
+
 class PoseDetector:
     def __init__(self):
         mp_holistic = mp.solutions.holistic
@@ -101,6 +110,7 @@ class PoseDetector:
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         results = self.model.process(rgb)
         all_lms = _collect_all_landmarks(results)
+        self._face_lms_cache = _collect_face_landmarks(results)
 
         # Face-pose з FaceMesh (якщо є)
         face_pose = self._face_pose_from_mesh(results, all_lms)
@@ -157,6 +167,7 @@ class PoseDetector:
             confidence=float(np.mean(visibilities)),
             source="full",
             all_landmarks=all_lms,
+            face_landmarks=getattr(self, "_face_lms_cache", []),
         )
 
     def _face_pose_from_mesh(self, results, all_lms: list) -> PoseResult | None:
@@ -201,6 +212,7 @@ class PoseDetector:
             confidence=0.9,  # FaceMesh не дає score, але якщо знайдено — впевнено
             source="face",
             all_landmarks=all_lms,
+            face_landmarks=getattr(self, "_face_lms_cache", []),
         )
 
     @staticmethod

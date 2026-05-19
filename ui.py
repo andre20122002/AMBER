@@ -127,32 +127,40 @@ def render_photo_qr(
     photo_bgr: np.ndarray | None,
     qr_bgr: np.ndarray | None,
     seconds_left: int,
+    aging_in_progress: bool = False,
 ) -> pygame.Rect | None:
-    """Показує фото у верхній частині, QR-код знизу. Повертає Rect кнопки 'Готово' для тапу."""
+    """Показує фото у верхній частині, QR-код знизу.
+
+    Поки aging_in_progress=True — показує статус «Старіння обличчя...» замість QR.
+    """
     screen.fill(COLOR_BG)
     W, H = screen.get_size()
 
-    # Фото-прев'ю: верхні 60% екрана
+    # Фото-прев'ю: верхні ~45% екрана
     if photo_bgr is not None:
-        preview_h = int(H * 0.55)
+        preview_h = int(H * 0.45)
         ratio = photo_bgr.shape[1] / photo_bgr.shape[0]
         preview_w = int(preview_h * ratio)
-        if preview_w > W - 40:
-            preview_w = W - 40
+        if preview_w > W - 60:
+            preview_w = W - 60
             preview_h = int(preview_w / ratio)
         photo_resized = cv2.resize(photo_bgr, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
         photo_surf = bgr_to_surface(photo_resized)
-        screen.blit(photo_surf, ((W - preview_w) // 2, 40))
+        screen.blit(photo_surf, ((W - preview_w) // 2, 30))
 
-    # QR-код під фото
-    if qr_bgr is not None:
-        qr_size = 480
+    # Нижня зона: або статус aging, або QR
+    if aging_in_progress:
+        status_font = get_font(56)
+        _draw_centered_text(screen, "Старіння обличчя…", int(H * 0.62), status_font, COLOR_ACCENT)
+        _draw_centered_text(screen, "зачекайте кілька секунд", int(H * 0.70), get_font(36), COLOR_TEXT)
+    elif qr_bgr is not None:
+        qr_size = 360
         qr_resized = cv2.resize(qr_bgr, (qr_size, qr_size), interpolation=cv2.INTER_NEAREST)
         qr_surf = bgr_to_surface(qr_resized)
-        qr_y = int(H * 0.62)
+        qr_y = int(H * 0.55)
         screen.blit(qr_surf, ((W - qr_size) // 2, qr_y))
-        cap_font = get_font(36)
-        _draw_centered_text(screen, "Скануйте, щоб забрати фото", qr_y + qr_size + 40, cap_font, COLOR_TEXT)
+        cap_font = get_font(32)
+        _draw_centered_text(screen, "Скануйте, щоб забрати фото", qr_y + qr_size + 30, cap_font, COLOR_TEXT)
     else:
         _draw_centered_text(screen, "Фото збережено", int(H * 0.7), get_font(48), COLOR_TEXT)
 

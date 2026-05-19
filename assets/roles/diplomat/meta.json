@@ -3,5 +3,6 @@
   "title": "Дипломат ООН",
   "year": 2055,
   "slogan": "Ти будуєш мости між народами",
-  "button_label": "Дипломат"
+  "button_label": "Дипломат",
+  "age_offset": 30
 }
