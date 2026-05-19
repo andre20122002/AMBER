@@ -74,6 +74,11 @@ class CameraThread(threading.Thread):
                     time.sleep(0.1)
                     continue
 
+            # Mirror flip (kiosk-«дзеркало»): кадр віддзеркалений горизонтально
+            # ПЕРЕД pose detection, щоб координати були вже в правильному просторі.
+            if config.MIRROR_CAMERA:
+                frame = cv2.flip(frame, 1)
+
             # drop старого кадру, поклади новий
             try:
                 self._queue.get_nowait()

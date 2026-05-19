@@ -4,9 +4,10 @@
   B1: композиція в просторі ДИСПЛЕЯ (1080×1920), не в просторі кадру (1280×720).
   B2: alpha-blending через float-маску, не bitwise_and.
   G8: center-crop кадру 16:9 → 9:16 перед композицією.
-  G1: auto-fit костюма за pose (масштаб + зсув від плечей).
+  G1: auto-fit костюма за pose (масштаб + зсув + ротація плечей).
 """
 import logging
+import math
 
 import cv2
 import numpy as np
@@ -67,11 +68,16 @@ def center_crop_to_aspect(img: np.ndarray, target_w: int, target_h: int) -> np.n
     return cv2.resize(cropped, (target_w, target_h), interpolation=interp)
 
 
-def _fit_costume_to_pose(costume_rgba: np.ndarray, pose: PoseResult | None) -> np.ndarray:
-    """Affine warp костюма так, щоб дизайн-плечі збігалися з реальними плечима.
+def _fit_costume_to_pose(
+    costume_rgba: np.ndarray,
+    pose: PoseResult | None,
+    anchor_cy: float = COSTUME_DESIGN_SHOULDERS_CY,
+    anchor_w: float = COSTUME_DESIGN_SHOULDERS_W,
+) -> tuple[np.ndarray, dict]:
+    """Affine warp костюма так, щоб дизайн-плечі збігалися з реальними.
 
-    Костюм має ту саму розмірність, що й DISPLAY (попередньо ресайзнутий у RoleManager).
-    Якщо pose=None, повертаємо костюм без змін (у дефолтній позиції).
+    Повертає (warped, info), де info містить параметри warp'у для debug overlay:
+      {'scale': float, 'angle_deg': float, 'dst_x': int, 'dst_y': int}
     """
     H, W = costume_rgba.shape[:2]
 
@@ -79,26 +85,35 @@ def _fit_costume_to_pose(costume_rgba: np.ndarray, pose: PoseResult | None) -> n
         target_cx = DEFAULT_SHOULDERS_CX
         target_cy = DEFAULT_SHOULDERS_CY
         target_w = DEFAULT_SHOULDERS_W
+        angle_deg = 0.0
     else:
         target_cx, target_cy = pose.shoulders_center
-        target_w = max(pose.shoulders_width, 0.1)  # avoid divide-by-zero
+        target_w = max(pose.shoulders_width, 0.1)
+        # Кут нахилу плечей (вектор left → right). У дзеркальному кадрі
+        # left.x < right.x, тож горизонтальні плечі → angle ≈ 0.
+        dx = pose.right_shoulder[0] - pose.left_shoulder[0]
+        dy = pose.right_shoulder[1] - pose.left_shoulder[1]
+        angle_rad = math.atan2(dy, dx)
+        angle_deg = math.degrees(angle_rad)
+        # Clamp ±25°: захист від pose-glitch (різкі стрибки кутів)
+        angle_deg = float(np.clip(angle_deg, -25.0, 25.0))
 
-    scale = target_w / COSTUME_DESIGN_SHOULDERS_W
-    # обмеження, щоб уникнути екстремального скейлу
+    scale = target_w / anchor_w
     scale = float(np.clip(scale, 0.5, 2.0))
 
-    # Координати точки відліку (плечі) у пікселях канвасу костюма (симетричний)
+    # Anchor у пікселях канвасу костюма (симетричний по X)
     src_x = 0.5 * W
-    src_y = COSTUME_DESIGN_SHOULDERS_CY * H
+    src_y = anchor_cy * H
 
     dst_x = target_cx * W
     dst_y = target_cy * H
 
-    # Affine: масштабуємо навколо src, потім транслюємо так, щоб src перейшло в dst
-    M = np.array([
-        [scale, 0, dst_x - src_x * scale],
-        [0, scale, dst_y - src_y * scale],
-    ], dtype=np.float32)
+    # Повна affine: scale + rotate навколо src, потім translate src → dst
+    M = cv2.getRotationMatrix2D((src_x, src_y), -angle_deg, scale)
+    # getRotationMatrix2D обертає навколо center, тримає center на місці.
+    # Додаємо translation, щоб center перейшов з (src_x, src_y) у (dst_x, dst_y):
+    M[0, 2] += dst_x - src_x
+    M[1, 2] += dst_y - src_y
 
     warped = cv2.warpAffine(
         costume_rgba, M, (W, H),
@@ -106,7 +121,13 @@ def _fit_costume_to_pose(costume_rgba: np.ndarray, pose: PoseResult | None) -> n
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(0, 0, 0, 0),
     )
-    return warped
+    info = {
+        "scale": scale,
+        "angle_deg": angle_deg,
+        "dst_x": int(dst_x),
+        "dst_y": int(dst_y),
+    }
+    return warped, info
 
 
 def _alpha_paste_rgba_over_bgr(bgr: np.ndarray, rgba: np.ndarray) -> np.ndarray:
@@ -163,6 +184,8 @@ def compose(
     mask_float: np.ndarray,
     role: Role,
     pose: PoseResult | None,
+    debug: bool = False,
+    fps: float | None = None,
 ) -> np.ndarray:
     """Повертає BGR-зображення (DISPLAY_H × DISPLAY_W × 3) готове до рендеру в pygame."""
     W, H = config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT
@@ -172,22 +195,85 @@ def compose(
     mask_disp = center_crop_to_aspect(mask_float, W, H)
 
     # 2. Alpha-blend фігури на фоні ролі
-    alpha = mask_disp[..., None]  # (H, W, 1) float32
+    alpha = mask_disp[..., None]
     composite = (
         role.background_bgr.astype(np.float32) * (1.0 - alpha)
         + frame_disp.astype(np.float32) * alpha
     ).astype(np.uint8)
 
-    # 3. Auto-fit костюма за pose, накладаємо через alpha-канал
-    # Pose координати — у просторі ВХІДНОГО кадру камери. Після center-crop'у та ресайзу
-    # вони можуть зсунутися. Робимо пере-нормалізацію.
+    # 3. Auto-fit костюма за pose. Pose координати в просторі вхідного кадру,
+    # перенормалізуємо в простір display після center-crop'у.
     pose_in_display = _remap_pose_to_display(pose, frame_bgr.shape[:2], (H, W))
-    costume = _fit_costume_to_pose(role.costume_rgba, pose_in_display)
+    anchor_cy = getattr(role, "anchor_cy", COSTUME_DESIGN_SHOULDERS_CY)
+    anchor_w = getattr(role, "anchor_w", COSTUME_DESIGN_SHOULDERS_W)
+    costume, warp_info = _fit_costume_to_pose(role.costume_rgba, pose_in_display, anchor_cy, anchor_w)
     composite = _alpha_paste_rgba_over_bgr(composite, costume)
 
     # 4. Текст
     composite = _draw_text_overlay(composite, role)
+
+    # 5. Debug overlay (поверх всього)
+    if debug:
+        composite = _draw_debug_overlay(composite, pose_in_display, warp_info, fps)
+
     return composite
+
+
+def _draw_debug_overlay(
+    img_bgr: np.ndarray,
+    pose: PoseResult | None,
+    warp_info: dict,
+    fps: float | None,
+) -> np.ndarray:
+    """Малює landmarks, anchor point, текстову інформацію поверх композиту."""
+    H, W = img_bgr.shape[:2]
+    out = img_bgr.copy()
+
+    source_color = {
+        "full": (0, 255, 0),    # зелений
+        "face": (0, 200, 255),  # помаранчевий
+        "hold": (180, 180, 180),  # сірий
+    }
+
+    if pose is not None:
+        color = source_color.get(pose.source, (0, 255, 0))
+        for label, pt in [
+            ("L_sh", pose.left_shoulder),
+            ("R_sh", pose.right_shoulder),
+            ("head", pose.head),
+            ("hips", pose.hips_center),
+        ]:
+            x, y = int(pt[0] * W), int(pt[1] * H)
+            cv2.circle(out, (x, y), 12, color, -1)
+            cv2.circle(out, (x, y), 14, (0, 0, 0), 2)
+            cv2.putText(out, label, (x + 18, y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+        # Лінія між плечима (видно ротацію)
+        lx, ly = int(pose.left_shoulder[0] * W), int(pose.left_shoulder[1] * H)
+        rx, ry = int(pose.right_shoulder[0] * W), int(pose.right_shoulder[1] * H)
+        cv2.line(out, (lx, ly), (rx, ry), color, 3)
+
+    # Anchor (де у display сидить дизайн-плече костюма)
+    ax, ay = warp_info["dst_x"], warp_info["dst_y"]
+    cv2.drawMarker(out, (ax, ay), (0, 0, 255), cv2.MARKER_CROSS, 30, 3)
+
+    # Текстова інформація — верхній лівий кут
+    lines = []
+    if pose is not None:
+        lines.append(f"source={pose.source}  conf={pose.confidence:.2f}")
+    else:
+        lines.append("pose=None")
+    lines.append(f"scale={warp_info['scale']:.2f}  angle={warp_info['angle_deg']:+.1f}°")
+    if fps is not None:
+        lines.append(f"FPS={fps:.1f}")
+
+    y0 = 50
+    for i, line in enumerate(lines):
+        y = y0 + i * 40
+        cv2.putText(out, line, (22, y + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 0), 4)
+        cv2.putText(out, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+    return out
 
 
 def _remap_pose_to_display(

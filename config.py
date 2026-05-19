@@ -29,6 +29,15 @@ SEGMENTATION_THRESHOLD = 0.7  # бінарний fallback; основна лог
 MASK_BLUR_SIZE = 21
 POSE_MIN_CONFIDENCE = 0.5
 
+# Smoothing pose landmarks (One-Euro filter)
+POSE_SMOOTH_MIN_CUTOFF = 1.0   # менше → плавніше, але повільніше реагує
+POSE_SMOOTH_BETA = 0.007        # більше → швидше реагує на швидкі рухи
+POSE_HOLD_FRAMES = 30           # ≈1с при 30FPS — скільки тримати last-good коли pose lost
+
+# Дзеркальне відображення кадру (як справжнє дзеркало). Pose detection
+# відбувається ПІСЛЯ flip, тож координати вже в дзеркальному просторі.
+MIRROR_CAMERA = True
+
 # --- Адмін (без імпорту pygame) ---
 ADMIN_KEY_NAME = "F12"        # подвійне натискання
 ADMIN_KEY_TIMEOUT = 1.0       # секунди між першим і другим F12

@@ -1,10 +1,16 @@
-"""Pose detection через MediaPipe Pose — для auto-fit PNG-костюма під фігуру відвідувача.
+"""Pose detection через MediaPipe Pose + Face fallback.
 
-Повертає нормалізовані координати плечей, голови та центру стегон.
-overlay.py використовує їх, щоб scale/translate костюм перед накладанням.
+Стратегія:
+1. Спочатку повний pose (потрібно бачити плечі/торс)
+2. Якщо не вдалось — face detection і обчислення "уявних" плечей від bbox обличчя
+3. Якщо і це не вдалось — None (вище по стеку PoseTracker зробить hold-last-good)
+
+Повертає уніфікований PoseResult з полем .source, щоб overlay/debug могли
+розрізняти джерело.
 """
 import logging
 from dataclasses import dataclass
+from typing import Literal
 
 import cv2
 import mediapipe as mp
@@ -21,6 +27,8 @@ _RIGHT_SHOULDER = 12
 _LEFT_HIP = 23
 _RIGHT_HIP = 24
 
+PoseSource = Literal["full", "face", "hold"]
+
 
 @dataclass
 class PoseResult:
@@ -30,6 +38,7 @@ class PoseResult:
     head: tuple[float, float]
     hips_center: tuple[float, float]
     confidence: float
+    source: PoseSource = "full"
 
     @property
     def shoulders_center(self) -> tuple[float, float]:
@@ -48,23 +57,34 @@ class PoseResult:
 class PoseDetector:
     def __init__(self):
         mp_pose = mp.solutions.pose
-        self.model = mp_pose.Pose(
+        self.pose_model = mp_pose.Pose(
             model_complexity=1,
             enable_segmentation=False,
             min_detection_confidence=config.POSE_MIN_CONFIDENCE,
             min_tracking_confidence=config.POSE_MIN_CONFIDENCE,
         )
-        logger.info("Pose model loaded")
+        mp_face = mp.solutions.face_detection
+        # model_selection=1 — full-range (краще для близьких облич у kiosk)
+        self.face_model = mp_face.FaceDetection(
+            model_selection=1,
+            min_detection_confidence=0.5,
+        )
+        logger.info("Pose + FaceDetection models loaded")
 
     def detect(self, frame_bgr: np.ndarray) -> PoseResult | None:
+        """Спочатку повний pose; якщо None — face fallback."""
+        full = self._detect_full_pose(frame_bgr)
+        if full is not None:
+            return full
+        return self._detect_face_pose(frame_bgr)
+
+    def _detect_full_pose(self, frame_bgr: np.ndarray) -> PoseResult | None:
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        results = self.model.process(rgb)
+        results = self.pose_model.process(rgb)
         if not results.pose_landmarks:
             return None
 
         lm = results.pose_landmarks.landmark
-
-        # Перевірка видимості ключових точок
         required = [_LEFT_SHOULDER, _RIGHT_SHOULDER, _NOSE]
         visibilities = [lm[i].visibility for i in required]
         if min(visibilities) < config.POSE_MIN_CONFIDENCE:
@@ -74,13 +94,15 @@ class PoseDetector:
         right_sh = (lm[_RIGHT_SHOULDER].x, lm[_RIGHT_SHOULDER].y)
         head = (lm[_NOSE].x, lm[_NOSE].y)
 
-        # Hips можуть бути не видні (низ кадру обрізаний) — fallback на shoulders+offset
         left_hip = lm[_LEFT_HIP]
         right_hip = lm[_RIGHT_HIP]
         if left_hip.visibility > 0.3 and right_hip.visibility > 0.3:
             hips_center = ((left_hip.x + right_hip.x) / 2, (left_hip.y + right_hip.y) / 2)
         else:
-            hips_center = ((left_sh[0] + right_sh[0]) / 2, min(1.0, (left_sh[1] + right_sh[1]) / 2 + 0.3))
+            hips_center = (
+                (left_sh[0] + right_sh[0]) / 2,
+                min(1.0, (left_sh[1] + right_sh[1]) / 2 + 0.3),
+            )
 
         return PoseResult(
             left_shoulder=left_sh,
@@ -88,10 +110,54 @@ class PoseDetector:
             head=head,
             hips_center=hips_center,
             confidence=float(np.mean(visibilities)),
+            source="full",
+        )
+
+    def _detect_face_pose(self, frame_bgr: np.ndarray) -> PoseResult | None:
+        """Будує уявні плечі/тіло від bbox обличчя (для close-up, коли торс не видно)."""
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        results = self.face_model.process(rgb)
+        if not results.detections:
+            return None
+
+        # Беремо найбільше обличчя (близьке до камери)
+        best = max(results.detections, key=lambda d: d.location_data.relative_bounding_box.width)
+        bbox = best.location_data.relative_bounding_box
+        x, y, w, h = bbox.xmin, bbox.ymin, bbox.width, bbox.height
+
+        # Голова (за приблизним центром bbox, трохи вище — там очі/ніс)
+        head_x = x + w / 2
+        head_y = y + h * 0.4
+
+        # Уявні плечі: на 1.8 висоти обличчя нижче верху bbox, шириною 2.5 ширини обличчя
+        sh_cx = x + w / 2
+        sh_cy = y + h * 1.8
+        sh_half_w = w * 1.25
+
+        # Convention як у MediaPipe Pose: left = менший X на екрані (стандарт image space)
+        left_sh = (sh_cx - sh_half_w, sh_cy)
+        right_sh = (sh_cx + sh_half_w, sh_cy)
+
+        # Стегна — ще нижче (для симетрії з full-pose, хоча в face режимі вони поза кадром)
+        hips_y = sh_cy + h * 1.5
+        hips_center = (sh_cx, min(1.0, hips_y))
+
+        # Clamp координат у [0..1]
+        def clamp(p: tuple[float, float]) -> tuple[float, float]:
+            return (float(np.clip(p[0], 0.0, 1.0)), float(np.clip(p[1], 0.0, 1.0)))
+
+        return PoseResult(
+            left_shoulder=clamp(left_sh),
+            right_shoulder=clamp(right_sh),
+            head=clamp((head_x, head_y)),
+            hips_center=clamp(hips_center),
+            confidence=float(best.score[0]) if best.score else 0.5,
+            source="face",
         )
 
     def close(self) -> None:
-        self.model.close()
+        self.pose_model.close()
+        self.face_model.close()
 
 
 if __name__ == "__main__":
@@ -115,6 +181,7 @@ if __name__ == "__main__":
             preview = frame.copy()
             if pose:
                 h, w = frame.shape[:2]
+                color = (0, 255, 0) if pose.source == "full" else (0, 200, 255)
                 for label, pt in [
                     ("L_sh", pose.left_shoulder),
                     ("R_sh", pose.right_shoulder),
@@ -122,8 +189,14 @@ if __name__ == "__main__":
                     ("hips", pose.hips_center),
                 ]:
                     x, y = int(pt[0] * w), int(pt[1] * h)
-                    cv2.circle(preview, (x, y), 8, (0, 255, 0), -1)
-                    cv2.putText(preview, label, (x + 10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    cv2.circle(preview, (x, y), 8, color, -1)
+                    cv2.putText(preview, label, (x + 10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                cv2.putText(
+                    preview,
+                    f"source={pose.source} conf={pose.confidence:.2f}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2,
+                )
             cv2.imshow("pose", preview)
             if cv2.waitKey(30) & 0xFF == ord("q"):
                 break

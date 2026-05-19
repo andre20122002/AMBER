@@ -9,6 +9,7 @@ CLI:
   python main.py --windowed # розробка: вікно замість fullscreen
 """
 import argparse
+import collections
 import logging
 import sys
 import time
@@ -26,10 +27,30 @@ from overlay import compose
 from photo import save_photo
 from photo_server import PhotoHTTPServer
 from pose import PoseDetector
+from pose_smoother import PoseTracker
 from qr import make_qr
 from roles import Role, RoleManager
 from segmentation import Segmenter
 import ui
+
+
+class FPSCounter:
+    """Rolling average FPS на основі останніх N кадрів."""
+
+    def __init__(self, window: int = 30):
+        self._times: collections.deque[float] = collections.deque(maxlen=window)
+
+    def tick(self) -> None:
+        self._times.append(time.monotonic())
+
+    @property
+    def fps(self) -> float:
+        if len(self._times) < 2:
+            return 0.0
+        span = self._times[-1] - self._times[0]
+        if span <= 0:
+            return 0.0
+        return (len(self._times) - 1) / span
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +64,13 @@ class AppState(Enum):
 
 
 class App:
-    def __init__(self, mock: bool = False, windowed: bool = False, scale: float = 1.0):
+    def __init__(self, mock: bool = False, windowed: bool = False, scale: float = 1.0, debug: bool = False):
         self.mock = mock
         self.windowed = windowed
         self.scale = max(0.1, min(scale, 1.0))
+        self.debug = debug
         self.running = True
+        self.fps_counter = FPSCounter()
 
         pygame.init()
         # render_target — завжди 1080×1920 (всі координати в цьому просторі).
@@ -73,6 +96,7 @@ class App:
         self.camera.start()
         self.segmenter = Segmenter()
         self.pose_detector = PoseDetector()
+        self.pose_tracker = PoseTracker(self.pose_detector)
         self.role_manager = RoleManager()
         self.photo_server = PhotoHTTPServer()
         self.photo_server_ok = self.photo_server.start()
@@ -173,8 +197,12 @@ class App:
             return None
         try:
             mask = self.segmenter.get_mask(frame)
-            pose = self.pose_detector.detect(frame)
-            return compose(frame, mask, self.current_role, pose)
+            pose = self.pose_tracker.update(frame)
+            return compose(
+                frame, mask, self.current_role, pose,
+                debug=self.debug,
+                fps=self.fps_counter.fps if self.debug else None,
+            )
         except Exception:
             logger.exception("compose failed")
             return None
@@ -224,6 +252,8 @@ class App:
         self.last_photo_bgr = None
         self.last_qr_bgr = None
         self._last_composite = None
+        # Скидаємо smoothing — наступний відвідувач починає з чистого аркуша
+        self.pose_tracker.reset()
         self._transition(AppState.IDLE)
 
     # --- Render ---
@@ -262,12 +292,16 @@ class App:
     # --- Main loop ---
 
     def run(self) -> None:
-        logger.info("Entering main loop (mock=%s, windowed=%s)", self.mock, self.windowed)
+        logger.info(
+            "Entering main loop (mock=%s, windowed=%s, scale=%.2f, debug=%s)",
+            self.mock, self.windowed, self.scale, self.debug,
+        )
         try:
             while self.running:
                 self._handle_events()
                 self._tick()
                 self._render()
+                self.fps_counter.tick()
                 self.clock.tick(config.TARGET_FPS)
         finally:
             self.shutdown()
@@ -292,6 +326,10 @@ def parse_args() -> argparse.Namespace:
         "--scale", type=float, default=1.0,
         help="Масштаб вікна для dev (наприклад 0.5 → 540×960). Тач-координати інверс-масштабуються.",
     )
+    p.add_argument(
+        "--debug", action="store_true",
+        help="Показувати landmarks/anchor/FPS поверх композиту (для tuning трекінга).",
+    )
     return p.parse_args()
 
 
@@ -299,7 +337,7 @@ def main() -> int:
     args = parse_args()
     setup_logging()
     logger.info("Starting kiosk; argv=%s", sys.argv)
-    app = App(mock=args.mock, windowed=args.windowed, scale=args.scale)
+    app = App(mock=args.mock, windowed=args.windowed, scale=args.scale, debug=args.debug)
     app.run()
     return 0
 

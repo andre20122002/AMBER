@@ -27,6 +27,9 @@ class Role:
     # Кешовані ресайзнуті ассети (заповнюються в RoleManager._load_role)
     costume_rgba: np.ndarray  # (DISPLAY_H, DISPLAY_W, 4) uint8
     background_bgr: np.ndarray  # (DISPLAY_H, DISPLAY_W, 3) uint8
+    # Опційні per-role anchor overrides (де у дизайні костюма «плечі»)
+    anchor_cy: float = 0.28
+    anchor_w: float = 0.45
 
 
 class RoleManager:
@@ -81,6 +84,7 @@ class RoleManager:
             raise ValueError(f"Could not read background image: {bg_path}")
         background_bgr = cv2.resize(bg, (config.DISPLAY_WIDTH, config.DISPLAY_HEIGHT), interpolation=cv2.INTER_AREA)
 
+        anchor = meta.get("costume_anchor") or {}
         return Role(
             id=meta["id"],
             title=meta["title"],
@@ -90,6 +94,8 @@ class RoleManager:
             dir=role_dir,
             costume_rgba=costume_rgba,
             background_bgr=background_bgr,
+            anchor_cy=float(anchor.get("shoulders_cy", 0.28)),
+            anchor_w=float(anchor.get("shoulders_w", 0.45)),
         )
 
     def list(self) -> list[Role]:
